@@ -57,10 +57,10 @@ class Controller:
         Kp_RP_rate = 0.5
         Ki_RP_rate = 0.01
         Kd_RP_rate = 0.0  # 0.001
-        Kp_Y = 5
-        Kp_Y_rate = 1
-        Ki_Y_rate = 0.8
-        Kd_Y_rate = 0
+        Kp_Y = 10.0
+        Kp_Y_rate = 2.0
+        Ki_Y_rate = 0.0
+        Kd_Y_rate = 0.5
         I_clamp_att = 0.5
 
         Kp_th = 4

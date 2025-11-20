@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import mujoco as mj
 from mujoco.glfw import glfw
 import numpy as np
@@ -8,6 +9,14 @@ import os
 import rospkg
 from datetime import datetime
 import matplotlib.pyplot as plt
+
+# ROS Imports
+import rospy
+from sensor_msgs.msg import Imu, Image
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Quaternion, Vector3, Point
+from cv_bridge import CvBridge
+import tf
 
 from aero_force_v2 import aero, nWagner
 from Controller_PID_v1 import *
@@ -177,6 +186,48 @@ def original_states(model, data, posID_dic, jvelID_dic):
     xd[13:23] = list(np.transpose(R_body).flatten())
     return xd, R_body
 
+def get_imu_data(model, data, body_name, bodyID_dic):
+    """
+    Computes simulated IMU data (accelerometer and gyroscope) for a given body.
+    Returns:
+        accel (np.array): [ax, ay, az] in body frame (m/s^2)
+        gyro (np.array): [gx, gy, gz] in body frame (rad/s)
+    """
+    if body_name not in bodyID_dic:
+        return np.zeros(3), np.zeros(3)
+    
+    body_id = bodyID_dic[body_name]
+    
+    # Rotation matrix from body to world
+    R_body_world = data.xmat[body_id].reshape(3, 3)
+    
+    # Angular velocity in world frame
+    # cvel is 6D spatial velocity: [rotational (3), translational (3)]
+    # Note: Mujoco's cvel is [rx, ry, rz, vx, vy, vz]
+    cvel = data.cvel[body_id]
+    w_world = cvel[0:3]
+    
+    # Transform angular velocity to body frame
+    gyro = R_body_world.T @ w_world
+    
+    # Linear acceleration
+    # cacc is 6D spatial acceleration: [rotational (3), translational (3)]
+    # We need to ensure cacc is computed. mj_rnePostConstraint should be called before this.
+    cacc = data.cacc[body_id]
+    a_world = cacc[3:6]
+    
+    # Add gravity (IMU measures proper acceleration: a - g)
+    # Gravity in world frame is usually [0, 0, -9.81]
+    g_world = model.opt.gravity
+    
+    # Proper acceleration in world frame
+    proper_acc_world = a_world #- g_world
+    
+    # Transform to body frame
+    accel = R_body_world.T @ proper_acc_world
+    
+    return accel, gyro
+
 """ ------------------------MAIN SIMULATION--------------------------------------- """
 # Get paths
 rospack = rospkg.RosPack()
@@ -201,7 +252,7 @@ opt = mj.MjvOption()
 glfw.init()
 window = glfw.create_window(1200, 900, "Flappy Teleop Simulation", None, None)
 glfw.make_context_current(window)
-glfw.swap_interval(1)
+glfw.swap_interval(0) # Disable V-Sync for max speed
 
 # Initialize visualization data structures
 mj.mjv_defaultCamera(cam)
@@ -228,7 +279,7 @@ bodyID_dic, jntID_dic, posID_dic, jvelID_dic = get_bodyIDs(body_list, model)
 jID_dic = get_jntIDs(joint_list, model)
 
 # Load joint angle data
-flap_freq = 5
+flap_freq = 3
 Angle_data = pd.read_csv(csv_path, header=None)
 J5_m = Angle_data.loc[:, 0]
 J6_m = Angle_data.loc[:, 1]
@@ -245,7 +296,7 @@ controller.z_d = 1.0
 controller.yaw_d = 0.0
 
 # Simulation parameters
-dt = 1e-5
+dt = 2e-3 # Increased time step for speed (500Hz physics)
 model.opt.timestep = dt
 simend = 100 # Longer simulation time for teleop
 xa = np.zeros(3 * nWagner)
@@ -255,10 +306,23 @@ camera_name = 'onboard_camera'
 inset_width = 640
 inset_height = 480
 camera_rate = 25.0 # Hz
+imu_rate = 200.0 # Hz
 
 # Initialize OpenCV window
-cv2.namedWindow("Onboard Camera", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Onboard Camera", 640, 480)
+# cv2.namedWindow("Onboard Camera", cv2.WINDOW_NORMAL)
+# cv2.resizeWindow("Onboard Camera", 640, 480)
+
+# Pre-allocate image buffer
+rgb_pixels = np.zeros((inset_height, inset_width, 3), dtype=np.uint8)
+
+# ROS Initialization
+rospy.init_node('flappy_sim_node', anonymous=True)
+pub_imu_core = rospy.Publisher('/flappy/core/imu', Imu, queue_size=10)
+pub_imu_guard = rospy.Publisher('/flappy/guard/imu', Imu, queue_size=10)
+pub_image = rospy.Publisher('/flappy/camera/image_raw', Image, queue_size=10)
+pub_odom = rospy.Publisher('/flappy/ground_truth/odom', Odometry, queue_size=10)
+br = tf.TransformBroadcaster()
+bridge = CvBridge()
 
 i = 0
 cage_collision_enabled = False
@@ -281,124 +345,197 @@ aero_forces_log = []
 time_log = []
 
 t_start = time.time() # Start timer exactly when loop begins
+ros_start_time = rospy.Time.now() # Base time for ROS timestamps
 
-while not glfw.window_should_close(window):
+# Timing variables for decoupled loop
+last_imu_time = 0.0
+last_cam_time = 0.0
+last_render_time = 0.0
+render_interval = 1.0 / 30.0 # 30 FPS for main window
+flapping_gain = 0.0 # Ramp for flapping start/stop
+
+while not glfw.window_should_close(window) and not rospy.is_shutdown():
     
     # ---------------- PHYSICS LOOP ----------------
-    # Run exactly 'steps_per_frame' physics steps before rendering once.
-    # This guarantees strict synchronization between physics and video.
-    steps_per_frame = int(1.0 / (camera_rate * dt)) # e.g., 33 steps per frame
-    for _ in range(steps_per_frame):
-        # Enable cage collision after 0.5 seconds (robot has settled)
-        if not cage_collision_enabled and data.time > 0.5:
-            try:
-                cage_geom_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'cage_collision')
-                model.geom_contype[cage_geom_id] = 1
-                model.geom_conaffinity[cage_geom_id] = 1
-                cage_collision_enabled = True
-                print(f"Cage collision enabled at t={data.time:.2f}s")
-            except:
-                pass
-        
-        # Aerodynamics
-        xd, R_body = original_states(model, data, posID_dic, jvelID_dic)
-        
-        if flapping_enabled:
-            J5v_d = np.interp(data.time, t_m, J5v_m, period=1.0 / flap_freq)
-            J6v_d = np.interp(data.time, t_m, J6v_m, period=1.0 / flap_freq)
-        else:
-            J5v_d = 0.0
-            J6v_d = 0.0
-
-        xd[5] = J5v_d
-        xd[6] = J6v_d
-        
-        fa, ua, xd = aero(xd, R_body, xa)
-        xa = xa + fa * dt
-        
-        # Log forces
-        aero_forces_log.append(ua[2:5])
-        time_log.append(data.time)
-
-        # Apply aero forces
-        if "L3" in jvelID_dic and "L7" in jvelID_dic:
-            data.qfrc_applied[jvelID_dic["L3"]] = ua[0]
-            data.qfrc_applied[jvelID_dic["L7"]] = ua[1]
-        if "Core" in bodyID_dic:
-            data.xfrc_applied[bodyID_dic["Core"]] = [*ua[2:5], *ua[5:8]]
-        
-        # Wing flapping
-        if flapping_enabled:
-            J5_ = np.interp(data.time, t_m, J5_m, period=1.0/flap_freq)
-            J6_ = np.interp(data.time, t_m, J6_m, period=1.0/flap_freq)
-        else:
-            J5_ = J5_m[0]
-            J6_ = J6_m[0]
-            
-        J5_d = J5_ - np.deg2rad(11.345825599281223)
-        J6_d = J6_ + np.deg2rad(27.45260202) - J5_
-        
+    # Run physics as fast as possible
+    
+    # Enable cage collision after 0.5 seconds (robot has settled)
+    if not cage_collision_enabled and data.time > 0.5:
         try:
-            data.actuator("J5_angle").ctrl[0] = J5_d
-            data.actuator("J6_angle").ctrl[0] = J6_d
+            cage_geom_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'cage_collision')
+            model.geom_contype[cage_geom_id] = 1
+            model.geom_conaffinity[cage_geom_id] = 1
+            cage_collision_enabled = True
+            print(f"Cage collision enabled at t={data.time:.2f}s")
         except:
             pass
-        
-        # Simulation step
-        mj.mj_step(model, data)
-        i += 1
     
+    # Aerodynamics
+    xd, R_body = original_states(model, data, posID_dic, jvelID_dic)
+    
+    # Smooth flapping transition to avoid force spikes
+    target_gain = 1.0 if flapping_enabled else 0.0
+    if flapping_gain < target_gain:
+        flapping_gain = min(target_gain, flapping_gain + dt * 5.0) # Ramp up over 0.2s
+    elif flapping_gain > target_gain:
+        flapping_gain = max(target_gain, flapping_gain - dt * 5.0) # Ramp down over 0.2s
+
+    if flapping_gain > 0:
+        J5v_d = np.interp(data.time, t_m, J5v_m, period=1.0 / flap_freq) * flapping_gain
+        J6v_d = np.interp(data.time, t_m, J6v_m, period=1.0 / flap_freq) * flapping_gain
+    else:
+        J5v_d = 0.0
+        J6v_d = 0.0
+
+    xd[5] = J5v_d
+    xd[6] = J6v_d
+    
+    fa, ua, xd = aero(xd, R_body, xa)
+    xa = xa + fa * dt
+    
+    # Log forces
+    aero_forces_log.append(ua[2:5])
+    time_log.append(data.time)
+
+    # Apply aero forces
+    if "L3" in jvelID_dic and "L7" in jvelID_dic:
+        data.qfrc_applied[jvelID_dic["L3"]] = ua[0]
+        data.qfrc_applied[jvelID_dic["L7"]] = ua[1]
+    if "Core" in bodyID_dic:
+        data.xfrc_applied[bodyID_dic["Core"]] = [*ua[2:5], *ua[5:8]]
+    
+    # Wing flapping
+    # Calculate raw flapping angles
+    J5_flap = np.interp(data.time, t_m, J5_m, period=1.0/flap_freq)
+    J6_flap = np.interp(data.time, t_m, J6_m, period=1.0/flap_freq)
+    
+    # Calculate static angles (rest position)
+    J5_static = J5_m[0]
+    J6_static = J6_m[0]
+    
+    # Blend based on gain to ensure smooth physical transition
+    J5_ = J5_static + (J5_flap - J5_static) * flapping_gain
+    J6_ = J6_static + (J6_flap - J6_static) * flapping_gain
+        
+    J5_d = J5_ - np.deg2rad(11.345825599281223)
+    J6_d = J6_ + np.deg2rad(27.45260202) - J5_
+    
+    try:
+        data.actuator("J5_angle").ctrl[0] = J5_d
+        data.actuator("J6_angle").ctrl[0] = J6_d
+    except:
+        pass
+    
+    # Simulation step
+    mj.mj_step(model, data)
+    i += 1
+
+    # -------- IMU PUBLISHING (High Frequency) --------
+    if data.time - last_imu_time >= (1.0 / imu_rate):
+        last_imu_time = data.time
+        
+        # Use simulation time for synchronization
+        current_time = ros_start_time + rospy.Duration(data.time)
+        
+        # 1. Publish Core IMU (using sensors from XML)
+        # Core Gyro: datasensor[16:19], Core Accel: datasensor[19:22]
+        imu_msg_core = Imu()
+        imu_msg_core.header.stamp = current_time
+        imu_msg_core.header.frame_id = "core_link"
+        imu_msg_core.angular_velocity = Vector3(data.sensordata[16], data.sensordata[17], data.sensordata[18])
+        imu_msg_core.linear_acceleration = Vector3(data.sensordata[19], data.sensordata[20], data.sensordata[21])
+        pub_imu_core.publish(imu_msg_core)
+        
+        # 2. Publish Guard IMU (using sensors from XML)
+        # Guard Gyro: datasensor[22:25], Guard Accel: datasensor[25:28]
+        imu_msg_guard = Imu()
+        imu_msg_guard.header.stamp = current_time
+        imu_msg_guard.header.frame_id = "guard_link"
+        imu_msg_guard.angular_velocity = Vector3(data.sensordata[22], data.sensordata[23], data.sensordata[24])
+        imu_msg_guard.linear_acceleration = Vector3(data.sensordata[25], data.sensordata[26], data.sensordata[27])
+        pub_imu_guard.publish(imu_msg_guard)
+
     if (data.time >= simend):
         break
     
-    # Get framebuffer viewport
-    viewport_width, viewport_height = glfw.get_framebuffer_size(window)
-    viewport = mj.MjrRect(0, 0, viewport_width, viewport_height)
-    
-    # ******** ONBOARD CAMERA (Hidden from main window) *********
-    # Since we are now synchronized (1 frame per loop iteration), we don't need the time check anymore
-    # The loop itself runs at 'camera_rate' effectively
-    
-    # We render to the bottom-left corner (0,0), but it will be overwritten later
-    offscreen_viewport = mj.MjrRect(0, 0, inset_width, inset_height)
-    
-    # Set camera to onboard_camera
-    try:
-        camera_id = model.camera(camera_name).id
-        offscreen_cam = mj.MjvCamera()
-        offscreen_cam.type = mj.mjtCamera.mjCAMERA_FIXED
-        offscreen_cam.fixedcamid = camera_id
+    # ROS Publishing (Low Frequency - Camera Rate)
+    if data.time - last_cam_time >= (1.0 / camera_rate):
+        last_cam_time = data.time
+        current_time = ros_start_time + rospy.Duration(data.time)
         
-        # Update scene for offscreen camera
-        mj.mjv_updateScene(model, data, opt, None, offscreen_cam, mj.mjtCatBit.mjCAT_ALL.value, scene)
+        # 3. Publish Ground Truth (Odometry)
+        if "Core" in bodyID_dic:
+            core_id = bodyID_dic["Core"]
+            pos = data.xpos[core_id]
+            quat = data.xquat[core_id] # [w, x, y, z]
+            cvel = data.cvel[core_id] # [rx, ry, rz, vx, vy, vz]
+            
+            odom_msg = Odometry()
+            odom_msg.header.stamp = current_time
+            odom_msg.header.frame_id = "world"
+            odom_msg.child_frame_id = "core_link"
+            
+            odom_msg.pose.pose.position = Point(*pos)
+            odom_msg.pose.pose.orientation = Quaternion(x=quat[1], y=quat[2], z=quat[3], w=quat[0])
+            
+            odom_msg.twist.twist.linear = Vector3(*cvel[3:6])
+            odom_msg.twist.twist.angular = Vector3(*cvel[0:3])
+            
+            pub_odom.publish(odom_msg)
+            
+            # Publish TF
+            br.sendTransform(pos, (quat[1], quat[2], quat[3], quat[0]), current_time, "core_link", "world")
+
+        # ******** ONBOARD CAMERA (Hidden from main window) *********
+        # We render to the bottom-left corner (0,0), but it will be overwritten later
+        offscreen_viewport = mj.MjrRect(0, 0, inset_width, inset_height)
         
-        # Render the camera view
-        mj.mjr_render(offscreen_viewport, scene, context)
-        
-        # Read pixels for display and saving
-        rgb_pixels = np.zeros((inset_height, inset_width, 3), dtype=np.uint8)
-        mj.mjr_readPixels(rgb_pixels, None, offscreen_viewport, context)
-        
-        # Flip vertically for OpenCV
-        rgb_flipped = cv2.flip(rgb_pixels, 0)
-        rgb_bgr = cv2.cvtColor(rgb_flipped, cv2.COLOR_RGB2BGR)
-        
-        # Add timestamp to image
-        cv2.putText(rgb_bgr, f"t={data.time:.3f}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # Save image if requested
-        if save_image_request:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            filename = os.path.join(slam_data_dir, f"img_{timestamp}.png")
-            cv2.imwrite(filename, rgb_bgr)
-            print(f"Saved image: {filename}")
-            save_image_request = False
-        
-        cv2.imshow("Onboard Camera", rgb_bgr)
-        cv2.waitKey(1)
-    except:
-        pass
+        # Set camera to onboard_camera
+        try:
+            camera_id = model.camera(camera_name).id
+            offscreen_cam = mj.MjvCamera()
+            offscreen_cam.type = mj.mjtCamera.mjCAMERA_FIXED
+            offscreen_cam.fixedcamid = camera_id
+            
+            # Update scene for offscreen camera
+            mj.mjv_updateScene(model, data, opt, None, offscreen_cam, mj.mjtCatBit.mjCAT_ALL.value, scene)
+            
+            # Render the camera view
+            mj.mjr_render(offscreen_viewport, scene, context)
+            
+            # Read pixels for display and saving
+            # rgb_pixels = np.zeros((inset_height, inset_width, 3), dtype=np.uint8) # Pre-allocated
+            mj.mjr_readPixels(rgb_pixels, None, offscreen_viewport, context)
+            
+            # Flip vertically for OpenCV
+            rgb_flipped = cv2.flip(rgb_pixels, 0)
+            rgb_bgr = cv2.cvtColor(rgb_flipped, cv2.COLOR_RGB2BGR)
+            
+            # Publish Image to ROS
+            try:
+                img_msg = bridge.cv2_to_imgmsg(rgb_bgr, "bgr8")
+                img_msg.header.stamp = current_time
+                img_msg.header.frame_id = "camera_link"
+                pub_image.publish(img_msg)
+            except Exception as e:
+                print(f"Error publishing image: {e}")
+
+            # Add timestamp to image
+            # cv2.putText(rgb_bgr, f"t={data.time:.3f}", (10, 30), 
+            #             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            # Save image if requested
+            if save_image_request:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                filename = os.path.join(slam_data_dir, f"img_{timestamp}.png")
+                cv2.imwrite(filename, rgb_bgr)
+                print(f"Saved image: {filename}")
+                save_image_request = False
+            
+            # cv2.imshow("Onboard Camera", rgb_bgr)
+            # cv2.waitKey(1)
+        except:
+            pass
 
     # Print Realtime Factor every 1 second
     current_wall_time = time.time()
@@ -408,11 +545,20 @@ while not glfw.window_should_close(window):
         last_print_time = current_wall_time
 
     # Update main scene and render (This overwrites the camera view in the buffer)
-    mj.mjv_updateScene(model, data, opt, None, cam, mj.mjtCatBit.mjCAT_ALL.value, scene)
-    mj.mjr_render(viewport, scene, context)
+    # Render main window only at 30Hz to save resources
+    if time.time() - last_render_time >= render_interval:
+        last_render_time = time.time()
+        
+        # Get framebuffer viewport
+        viewport_width, viewport_height = glfw.get_framebuffer_size(window)
+        viewport = mj.MjrRect(0, 0, viewport_width, viewport_height)
+        
+        mj.mjv_updateScene(model, data, opt, None, cam, mj.mjtCatBit.mjCAT_ALL.value, scene)
+        mj.mjr_render(viewport, scene, context)
+        
+        # Swap buffers
+        glfw.swap_buffers(window)
     
-    # Swap buffers
-    glfw.swap_buffers(window)
     glfw.poll_events()
 
 # Cleanup

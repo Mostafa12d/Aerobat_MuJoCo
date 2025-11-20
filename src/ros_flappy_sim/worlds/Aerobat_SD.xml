@@ -70,12 +70,12 @@
 
     <!-- <body name="Aerobat" pos='0 0 0.5' quat="1 0 0 0"> -->
     <body name="Core" pos= "0 0 1.0" quat="1 0 0 0">  <!-- Spawning at 1m height to be inside cage -->
-        <camera name="onboard_camera" pos="0 0 0.1" quat="0.707 0.707 -0.707 -0.707"/>
+        <camera name="onboard_camera" pos="0 0 0.1" quat="0.707 0.707 -0.707 -0.707" fovy="60" resolution="640 480"/>
         <freejoint/>
                 
         <geom class="collision" mesh="Core"/>
         <geom class="visual" mesh="Core"/>
-        <inertial pos="0 0 0" quat="1 0 0 0" mass="0.040" diaginertia="1.905e-03 6.872e-04 2.261e-03"/> <!-- Core -0.015 -->
+        <inertial pos="0 0 0" quat="1 0 0 0" mass="0.030" diaginertia="1.905e-03 6.872e-04 2.261e-03"/> <!-- Core -0.015 -->
 
         <!-- Visual axes for Core body (to see if it rotates differently from Guard) -->
         <site name="core_x_axis" type="box" pos=".08 .0 .0" size=".08 .003 .003" quat="1 0 0 0" rgba="1 0 0 0.7"/>
@@ -89,11 +89,11 @@
         <body name="Guard" pos="0 0 0" quat="1 0 0 0">
             <!-- 6-DOF compliant connection: 3 translations + 3 rotations (rubber band behavior) -->
             <!-- Translation spring-dampers (very soft for visible rubber band stretch) -->
-            <joint name="guard_slide_x" type="slide" axis="1 0 0" stiffness="9" damping="1" limited="true" range="0.0 0.1"/>
-            <joint name="guard_slide_y" type="slide" axis="0 1 0" stiffness="9" damping="1" limited="true" range="0.0 0.1"/>
-            <joint name="guard_slide_z" type="slide" axis="0 0 1" stiffness="9" damping="1" limited="true" range="0.0 0.1"/>
+            <joint name="guard_slide_x" type="slide" axis="1 0 0" stiffness="8" damping="1" limited="true" range="-0.2 0.2"/>
+            <joint name="guard_slide_y" type="slide" axis="0 1 0" stiffness="8" damping="1" limited="true" range="-0.2 0.2"/>
+            <joint name="guard_slide_z" type="slide" axis="0 0 1" stiffness="8" damping="1" limited="true" range="-0.2 0.2" springref="-0.015"/>
             <!-- Rotation spring-dampers (soft for visible rotation) -->
-            <joint name="guard_ball" type="ball" stiffness="5" damping="1" limited="true" range="0 0.3"/>
+            <joint name="guard_ball" type="ball" stiffness="10" damping="1" limited="true" range="0 0.3"/>
 
                 <!-- Visual axes for Guard body (to see relative rotation) -->
                 <site name="guard_x_axis" type="box" pos=".06 .0 .0" size=".06 .004 .004" quat="1 0 0 0" rgba="1 0.5 0 0.9"/>
@@ -113,7 +113,7 @@
 
                 <geom class="collision" mesh="Guard"/>
                 <geom class="visual" mesh="Guard"/>
-                <inertial pos="0 0 0" quat="1 0 0 0" mass="0.083" diaginertia="1.905e-03 6.872e-04 2.261e-03"/> <!--With guard (prop)-->
+                <inertial pos="0 0 0" quat="1 0 0 0" mass="0.07" diaginertia="1.905e-03 6.872e-04 2.261e-03"/> <!--With guard (prop)-->
             </body>
 
             <body name="L3" pos="0.0052 0.020673 0.0075244" quat="0.372893 0.60079 0.372898 0.60079">
