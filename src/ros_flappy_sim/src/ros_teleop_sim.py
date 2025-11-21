@@ -279,7 +279,11 @@ bodyID_dic, jntID_dic, posID_dic, jvelID_dic = get_bodyIDs(body_list, model)
 jID_dic = get_jntIDs(joint_list, model)
 
 # Load joint angle data
-flap_freq = 3
+flap_freq_target = 3  # Target flapping frequency (Hz)
+flap_freq_initial = 0.5  # Start slow (0.5 Hz)
+flap_freq_ramp_time = 5.0  # Ramp up over 5 seconds
+flap_freq = flap_freq_initial  # Current frequency (will be updated in loop)
+
 Angle_data = pd.read_csv(csv_path, header=None)
 J5_m = Angle_data.loc[:, 0]
 J6_m = Angle_data.loc[:, 1]
@@ -298,7 +302,7 @@ controller.yaw_d = 0.0
 # Simulation parameters
 dt = 0.002  # 500Hz physics (balanced performance)
 model.opt.timestep = dt
-simend = 100 # Longer simulation time for teleop
+simend = 200 # Longer simulation time for teleop
 xa = np.zeros(3 * nWagner)
 
 # Camera settings for inset view
@@ -412,6 +416,13 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
     elif flapping_gain > target_gain:
         flapping_gain = max(target_gain, flapping_gain - dt * 5.0) # Ramp down over 0.2s
 
+    # Ramp flapping frequency smoothly when flapping is enabled
+    if flapping_enabled and data.time < flap_freq_ramp_time:
+        # Linear ramp from initial to target frequency
+        flap_freq = flap_freq_initial + (flap_freq_target - flap_freq_initial) * (data.time / flap_freq_ramp_time)
+    else:
+        flap_freq = flap_freq_target
+
     if flapping_gain > 0:
         J5v_d = np.interp(data.time, t_m, J5v_m, period=1.0 / flap_freq) * flapping_gain
         J6v_d = np.interp(data.time, t_m, J6v_m, period=1.0 / flap_freq) * flapping_gain
@@ -485,7 +496,7 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
         imu_msg_guard.header.frame_id = "guard_link"
         imu_msg_guard.angular_velocity = Vector3(data.sensordata[22], data.sensordata[23], data.sensordata[24])
         imu_msg_guard.linear_acceleration = Vector3(data.sensordata[25], data.sensordata[26], data.sensordata[27])
-        
+
         pub_imu_core.publish(imu_msg_core)
         pub_imu_guard.publish(imu_msg_guard)
 
@@ -513,8 +524,16 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
             
             pub_odom.publish(odom_msg)
             
-            # Publish TF
+            # Publish TF: world -> core_link
             br.sendTransform(pos, (quat[1], quat[2], quat[3], quat[0]), current_time, "core_link", "world")
+            
+            # Publish TF: core_link -> camera_link
+            # Camera is at pos="0 0 0.1" with quat="0.707 0.707 -0.707 -0.707" relative to Core
+            cam_pos = [0.0, 0.0, 0.1]
+            # Normalize the quaternion properly
+            cam_quat_raw = np.array([0.707, 0.707, -0.707, -0.707])  # [x, y, z, w]
+            cam_quat = cam_quat_raw / np.linalg.norm(cam_quat_raw)
+            br.sendTransform(cam_pos, cam_quat.tolist(), current_time, "camera_link", "core_link")
 
     # -------- CAMERA PUBLISHING (Decimated to 25Hz) --------
     if step_count % camera_decimation == 0:
@@ -627,6 +646,7 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
     glfw.poll_events()
 
 # Cleanup
+simend = data.time
 glfw.terminate()
 cv2.destroyAllWindows()
 
@@ -634,37 +654,37 @@ total_time = time.time() - t_start
 print(f"--- Total Time: {total_time:.2f} seconds ---")
 print(f"--- Total realtime factor: {simend/total_time:.2f}x ---")
 
-# Plotting
-if len(time_log) > 0:
-    aero_forces_log = np.array(aero_forces_log)
-    time_log = np.array(time_log)
+# # Plotting
+# if len(time_log) > 0:
+#     aero_forces_log = np.array(aero_forces_log)
+#     time_log = np.array(time_log)
 
-    plt.figure(figsize=(12, 8))
+#     plt.figure(figsize=(12, 8))
     
-    # Plot X, Y, Z components of Aerodynamic Force
-    plt.subplot(2, 1, 1)
-    plt.plot(time_log, aero_forces_log[:, 0], label='Force X (Drag/Thrust)')
-    plt.plot(time_log, aero_forces_log[:, 1], label='Force Y (Side)')
-    plt.plot(time_log, aero_forces_log[:, 2], label='Force Z (Lift)')
-    plt.title('Aerodynamic Forces on Body')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Force (N)')
-    plt.legend()
-    plt.grid(True)
+#     # Plot X, Y, Z components of Aerodynamic Force
+#     plt.subplot(2, 1, 1)
+#     plt.plot(time_log, aero_forces_log[:, 0], label='Force X (Drag/Thrust)')
+#     plt.plot(time_log, aero_forces_log[:, 1], label='Force Y (Side)')
+#     plt.plot(time_log, aero_forces_log[:, 2], label='Force Z (Lift)')
+#     plt.title('Aerodynamic Forces on Body')
+#     plt.xlabel('Time (s)')
+#     plt.ylabel('Force (N)')
+#     plt.legend()
+#     plt.grid(True)
 
-    # Calculate total force magnitude
-    total_aero_force = np.linalg.norm(aero_forces_log, axis=1)
+#     # Calculate total force magnitude
+#     total_aero_force = np.linalg.norm(aero_forces_log, axis=1)
 
-    # Plot Total Aerodynamic Force Magnitude
-    plt.subplot(2, 1, 2)
-    plt.plot(time_log, total_aero_force, label='Total Aero Force Magnitude', color='black')
-    plt.title('Total Aerodynamic Force Magnitude')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Force (N)')
-    plt.legend()
-    plt.grid(True)
+#     # Plot Total Aerodynamic Force Magnitude
+#     plt.subplot(2, 1, 2)
+#     plt.plot(time_log, total_aero_force, label='Total Aero Force Magnitude', color='black')
+#     plt.title('Total Aerodynamic Force Magnitude')
+#     plt.xlabel('Time (s)')
+#     plt.ylabel('Force (N)')
+#     plt.legend()
+#     plt.grid(True)
 
-    plt.tight_layout()
-    plt.show()
-else:
-    print("No data logged for plotting.")
+#     plt.tight_layout()
+#     plt.show()
+# else:
+#     print("No data logged for plotting.")
