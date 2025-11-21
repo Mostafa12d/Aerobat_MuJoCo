@@ -296,7 +296,7 @@ controller.z_d = 1.0
 controller.yaw_d = 0.0
 
 # Simulation parameters
-dt = 2e-3 # Increased time step for speed (500Hz physics)
+dt = 0.002  # 500Hz physics (balanced performance)
 model.opt.timestep = dt
 simend = 100 # Longer simulation time for teleop
 xa = np.zeros(3 * nWagner)
@@ -305,8 +305,19 @@ xa = np.zeros(3 * nWagner)
 camera_name = 'onboard_camera'
 inset_width = 640
 inset_height = 480
-camera_rate = 25.0 # Hz
-imu_rate = 200.0 # Hz
+
+# Sensor publishing rates (Hz)
+camera_rate = 25.0
+imu_rate = 250.0  # Adjusted to 250Hz (divides evenly: 500/2)
+odom_rate = 100.0  # Ground truth odometry rate
+
+# Calculate decimation factors (how many physics steps between sensor readings)
+physics_rate = 1.0 / dt  # 500Hz
+imu_decimation = int(round(physics_rate / imu_rate))      # Every 2 steps = 250Hz
+camera_decimation = int(round(physics_rate / camera_rate))  # Every 20 steps = 25Hz
+odom_decimation = int(round(physics_rate / odom_rate))    # Every 5 steps = 100Hz
+
+print(f"Physics: {physics_rate:.0f}Hz | IMU every {imu_decimation} steps = {physics_rate/imu_decimation:.0f}Hz | Camera every {camera_decimation} steps = {physics_rate/camera_decimation:.0f}Hz")
 
 # Initialize OpenCV window
 # cv2.namedWindow("Onboard Camera", cv2.WINDOW_NORMAL)
@@ -325,8 +336,10 @@ br = tf.TransformBroadcaster()
 bridge = CvBridge()
 
 i = 0
+step_count = 0
 cage_collision_enabled = False
 last_print_time = time.time()
+last_sim_time = 0.0
 
 print("\n" + "="*60)
 print("           KEYBOARD TELEOP INSTRUCTIONS")
@@ -348,16 +361,35 @@ t_start = time.time() # Start timer exactly when loop begins
 ros_start_time = rospy.Time.now() # Base time for ROS timestamps
 
 # Timing variables for decoupled loop
-last_imu_time = 0.0
-last_cam_time = 0.0
 last_render_time = 0.0
 render_interval = 1.0 / 30.0 # 30 FPS for main window
 flapping_gain = 0.0 # Ramp for flapping start/stop
 
+# Time-based publishing (based on simulation time, not steps)
+last_imu_publish_time = 0.0
+last_camera_publish_time = 0.0
+last_odom_publish_time = 0.0
+imu_publish_interval = 1.0 / imu_rate
+camera_publish_interval = 1.0 / camera_rate
+odom_publish_interval = 1.0 / odom_rate
+
+# Real-time synchronization
+target_realtime_factor = 1.0
+time_error_accumulator = 0.0
+
 while not glfw.window_should_close(window) and not rospy.is_shutdown():
     
-    # ---------------- PHYSICS LOOP ----------------
-    # Run physics as fast as possible
+    # Calculate target wall time for current simulation time
+    target_wall_time = t_start + (data.time / target_realtime_factor)
+    current_wall_time = time.time()
+    time_error = target_wall_time - current_wall_time
+    
+    # Sleep if we're ahead of schedule
+    if time_error > 0:
+        time.sleep(min(time_error, dt))  # Sleep up to one timestep
+    
+    # ---------------- PHYSICS STEP ----------------
+    step_start_time = time.time()
     
     # Enable cage collision after 0.5 seconds (robot has settled)
     if not cage_collision_enabled and data.time > 0.5:
@@ -429,13 +461,14 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
     # Simulation step
     mj.mj_step(model, data)
     i += 1
+    step_count += 1
 
-    # -------- IMU PUBLISHING (High Frequency) --------
-    if data.time - last_imu_time >= (1.0 / imu_rate):
-        last_imu_time = data.time
-        
-        # Use simulation time for synchronization
-        current_time = ros_start_time + rospy.Duration(data.time)
+    # Use simulation time for all ROS timestamps
+    current_time = ros_start_time + rospy.Duration(data.time)
+
+    # -------- IMU PUBLISHING (Time-based: 250Hz) --------
+    if data.time - last_imu_publish_time >= imu_publish_interval:
+        last_imu_publish_time = data.time
         
         # 1. Publish Core IMU (using sensors from XML)
         # Core Gyro: datasensor[16:19], Core Accel: datasensor[19:22]
@@ -444,7 +477,6 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
         imu_msg_core.header.frame_id = "core_link"
         imu_msg_core.angular_velocity = Vector3(data.sensordata[16], data.sensordata[17], data.sensordata[18])
         imu_msg_core.linear_acceleration = Vector3(data.sensordata[19], data.sensordata[20], data.sensordata[21])
-        pub_imu_core.publish(imu_msg_core)
         
         # 2. Publish Guard IMU (using sensors from XML)
         # Guard Gyro: datasensor[22:25], Guard Accel: datasensor[25:28]
@@ -453,15 +485,13 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
         imu_msg_guard.header.frame_id = "guard_link"
         imu_msg_guard.angular_velocity = Vector3(data.sensordata[22], data.sensordata[23], data.sensordata[24])
         imu_msg_guard.linear_acceleration = Vector3(data.sensordata[25], data.sensordata[26], data.sensordata[27])
+        
+        pub_imu_core.publish(imu_msg_core)
         pub_imu_guard.publish(imu_msg_guard)
 
-    if (data.time >= simend):
-        break
-    
-    # ROS Publishing (Low Frequency - Camera Rate)
-    if data.time - last_cam_time >= (1.0 / camera_rate):
-        last_cam_time = data.time
-        current_time = ros_start_time + rospy.Duration(data.time)
+    # -------- ODOMETRY PUBLISHING (Time-based: 100Hz) --------
+    if data.time - last_odom_publish_time >= odom_publish_interval:
+        last_odom_publish_time = data.time
         
         # 3. Publish Ground Truth (Odometry)
         if "Core" in bodyID_dic:
@@ -486,6 +516,36 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
             # Publish TF
             br.sendTransform(pos, (quat[1], quat[2], quat[3], quat[0]), current_time, "core_link", "world")
 
+    # -------- CAMERA PUBLISHING (Decimated to 25Hz) --------
+    if step_count % camera_decimation == 0:
+        
+        # 3. Publish Ground Truth (Odometry)
+        if "Core" in bodyID_dic:
+            core_id = bodyID_dic["Core"]
+            pos = data.xpos[core_id]
+            quat = data.xquat[core_id] # [w, x, y, z]
+            cvel = data.cvel[core_id] # [rx, ry, rz, vx, vy, vz]
+            
+            odom_msg = Odometry()
+            odom_msg.header.stamp = current_time
+            odom_msg.header.frame_id = "world"
+            odom_msg.child_frame_id = "core_link"
+            
+            odom_msg.pose.pose.position = Point(*pos)
+            odom_msg.pose.pose.orientation = Quaternion(x=quat[1], y=quat[2], z=quat[3], w=quat[0])
+            
+            odom_msg.twist.twist.linear = Vector3(*cvel[3:6])
+            odom_msg.twist.twist.angular = Vector3(*cvel[0:3])
+            
+            pub_odom.publish(odom_msg)
+            
+            # Publish TF
+            br.sendTransform(pos, (quat[1], quat[2], quat[3], quat[0]), current_time, "core_link", "world")
+
+    # -------- CAMERA PUBLISHING (Time-based: 25Hz) --------
+    if data.time - last_camera_publish_time >= camera_publish_interval:
+        last_camera_publish_time = data.time
+        
         # ******** ONBOARD CAMERA (Hidden from main window) *********
         # We render to the bottom-left corner (0,0), but it will be overwritten later
         offscreen_viewport = mj.MjrRect(0, 0, inset_width, inset_height)
@@ -537,12 +597,17 @@ while not glfw.window_should_close(window) and not rospy.is_shutdown():
         except:
             pass
 
+    if (data.time >= simend):
+        break
+
     # Print Realtime Factor every 1 second
     current_wall_time = time.time()
     if current_wall_time - last_print_time > 1.0:
-        rt_factor = (data.time) / (current_wall_time - t_start)
-        print(f"Realtime Factor: {rt_factor:.2f}x")
+        rt_factor = (data.time - last_sim_time) / (current_wall_time - last_print_time)
+        steps_per_sec = step_count / (current_wall_time - t_start)
+        print(f"RT: {rt_factor:.2f}x | Sim: {data.time:.2f}s | Physics: {steps_per_sec:.0f}Hz")
         last_print_time = current_wall_time
+        last_sim_time = data.time
 
     # Update main scene and render (This overwrites the camera view in the buffer)
     # Render main window only at 30Hz to save resources
